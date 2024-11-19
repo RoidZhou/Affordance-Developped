@@ -225,7 +225,7 @@ def pose2exp_coordinate(pose):
     inv_left_jacobian = np.eye(3, dtype=float) / theta - 0.5 * ss + (
             1.0 / theta - 0.5 / np.tan(theta / 2)) * ss @ ss # np.eye生成主对角元素为1， 其余元素为0的矩阵
     v = inv_left_jacobian @ pose[:3, 3]
-    return np.concatenate([omega, v]), theta
+    return np.concatenate([omega, v]), theta # [omega, v]组合得到一个六维向量，记作旋量
 
 def viz_mask(ids):
     return colors[ids]

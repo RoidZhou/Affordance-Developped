@@ -37,7 +37,9 @@ class Env(gym.Env):
         self.physicsClient = p.connect(p.GUI if self.vis else p.DIRECT)
         # add search path for loadURDF
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
-        p.configureDebugVisualizer(lightPosition=[0, 0, 0.1])
+        # p.configureDebugVisualizer(lightPosition=[0, 0, 0.1])
+        #开启光线渲染
+        p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 1)  # Shadows on/off
         # define world
         p.setGravity(0, 0, -10) # NOTE
         p.setTimeStep = self.control_dt
@@ -91,7 +93,7 @@ class Env(gym.Env):
     
     def load_robot(self):
         self.robotID = p.loadURDF(self.robotUrdfPath, self.robotStartPos, self.robotStartOrn,
-                     flags=p.URDF_USE_SELF_COLLISION_EXCLUDE_PARENT)
+                     flags=p.URDF_USE_SELF_COLLISION_EXCLUDE_PARENT, useFixedBase=True)
         
     def set_target_object_part_actor_id(self, actor_id, custom=True):
         self.target_object_part_actor_id = actor_id
@@ -105,11 +107,11 @@ class Env(gym.Env):
         eefPose_mat44[:3, 3] = pose
         relative_transform = np.linalg.inv(eefPose_mat44) @ target_ee_pose
 
-        unit_twist, theta = pose2exp_coordinate(relative_transform) # 获得扭转角度（theta）
+        unit_twist, theta = pose2exp_coordinate(relative_transform) # 获得单位旋量和轴角
         velocity = theta / time_to_target # 根据目标角度和时间计算角速度（或扭转速度）
         body_twist = unit_twist * velocity # 将单位扭转乘以速度，得到身体扭转（body twist），它表示在单位时间内末端执行器相对于其当前姿态的扭转
         current_ee_pose = eefPose_mat44
-        return adjoint_matrix(current_ee_pose) @ body_twist # 伴随矩阵在这里用于将身体扭转从末端执行器的局部坐标系转换到全局坐标系（或参考坐标系）
+        return adjoint_matrix(current_ee_pose) @ body_twist # adjoint_matrix(current_ee_pose)为ADT，ADT @ V 为速度旋量变化量
 
 
     def move_to_target_pose(self, target_ee_pose: np.ndarray, num_steps: int, custom=True) -> None:
@@ -123,11 +125,11 @@ class Env(gym.Env):
         """
         executed_time = num_steps * self.control_dt
 
-        spatial_twist = self.calculate_twist(executed_time, target_ee_pose)
+        spatial_twist = self.calculate_twist(executed_time, target_ee_pose) # [6, ]
         for i in range(num_steps):
             if i % 100 == 0:
                 spatial_twist = self.calculate_twist((num_steps - i) * self.control_dt, target_ee_pose)
-            qvel = self.compute_joint_velocity_from_twist(spatial_twist)
+            qvel = self.compute_joint_velocity_from_twist(spatial_twist) # 末端速度旋量转换到每个自由度
             # print("qvel : ", qvel)
             self.setJointPosition(self.robotID, qvel)
             self.step() # 报异常
@@ -276,6 +278,7 @@ class Env(gym.Env):
 
 
         mpos, mvel, mtorq = self.getMotorJointStates(self.robotID)
+        # mpos = mpos[:6]
         zero_vec = [0.0] * len(mpos)
         result = p.getLinkState(self.robotID,
                                 self.eefID,
@@ -284,7 +287,7 @@ class Env(gym.Env):
         link_trn, link_rot, com_trn, com_rot, frame_pos, frame_rot, link_vt, link_vr = result
         jac_t, jac_r = p.calculateJacobian(self.robotID, self.eefID, com_trn, mpos, zero_vec, zero_vec)
         
-        ee_jacobian = np.zeros([6, 6])
+        ee_jacobian = np.zeros([6, 6]) # 列为关节数
         jac_t = np.array(jac_t)[:, :6]
         jac_r = np.array(jac_r)[:, :6]
 
@@ -294,7 +297,7 @@ class Env(gym.Env):
         #numerical_small_bool = ee_jacobian < 1e-1
         #ee_jacobian[numerical_small_bool] = 0
         #inverse_jacobian = np.linalg.pinv(ee_jacobian)
-        inverse_jacobian = np.linalg.pinv(ee_jacobian, rcond=1e-2)
+        inverse_jacobian = np.linalg.inv(ee_jacobian)
         #inverse_jacobian[np.abs(inverse_jacobian) > 5] = 0
         #print(inverse_jacobian)
         return inverse_jacobian @ twist

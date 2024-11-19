@@ -29,6 +29,7 @@ import pybullet as p
 import pybullet_data
 from collections import namedtuple
 from attrdict import AttrDict
+import open3d as o3d
 
 parser = ArgumentParser()
 parser.add_argument('category', type=str) # StorageFurniture
@@ -69,11 +70,12 @@ if args.random_seed is not None:
     np.random.seed(args.random_seed)
     out_info['random_seed'] = args.random_seed
 
+# setup camera
+cam = Camera(dist=1, fixed_position=False)
+
 # setup env
 env = Env()
 
-# setup camera
-cam = Camera(dist=1, fixed_position=False)
 out_info['camera_metadata'] = cam.get_metadata_json()
 
 # p.resetDebugVisualizerCamera(2.0, -270., -60., (0., 0., 0.))
@@ -103,8 +105,8 @@ rgb, depth, _ = cam.shot()
 Image.fromarray((rgb).astype(np.uint8)).save(os.path.join(out_dir, 'rgb.png'))
 
 # 根据深度图（depth）和相机的内参矩阵来计算相机坐标系中的三维点
-cam_XYZA_id1, cam_XYZA_id2, cam_XYZA_pts = cam.compute_camera_XYZA(depth) # 返回有效深度值的像素位置（y, x）和计算出的三维点坐标（points）。
-''' show
+cam_XYZA_id1, cam_XYZA_id2, cam_XYZA_pts = cam.create_point_cloud_from_depth_image(depth) # 返回有效深度值的像素位置（y, x）和计算出的三维点坐标（points）。
+# ''' show
 pv.plot(
     cam_XYZA_pts,
     scalars=cam_XYZA_pts[:, 2],
@@ -112,7 +114,7 @@ pv.plot(
     point_size=5,
     show_scalar_bar=False,
 )
-'''
+# '''
 
 cloud = pcl.PointCloud(cam_XYZA_pts.astype(np.float32))
 # 创建SAC-IA分割对象
@@ -128,7 +130,7 @@ ground_points = cloud.extract(inliers, negative=False)
 non_ground_points = cloud.extract(inliers, negative=True)
 # 转换为array
 cam_XYZA_filter_pts = non_ground_points.to_array()
-''' show
+# ''' show
 pv.plot(
     cam_XYZA_filter_pts,
     scalars=cam_XYZA_filter_pts[:, 2],
@@ -136,20 +138,9 @@ pv.plot(
     point_size=5,
     show_scalar_bar=False,
 )
-'''
-# cam_XYZA_pts_tmp = np.around(np.array(cam_XYZA_pts), decimals=6)
-# cam_XYZA_filter_pts_tem = np.around(np.array(cam_XYZA_filter_pts), decimals=6)
-
+# '''
 cam_XYZA_pts_tmp = np.array(cam_XYZA_pts).astype(np.float32)
 cam_XYZA_filter_pts_tem = np.array(cam_XYZA_filter_pts).astype(np.float32)
-
-# filter_pc_index = np.array([np.where(cam_XYZA_pts_tmp == a)[0][0] for a in cam_XYZA_filter_pts_tem]).astype(np.uint8)
-
-# match_matrix = (cam_XYZA_pts_tmp[:, np.newaxis, :] == cam_XYZA_filter_pts_tem).all(axis=2)
-# filter_pc_index = np.argmax(match_matrix, axis=0)
-
-# match_matrix = np.any(np.abs(cam_XYZA_pts_tmp[:, np.newaxis, :] - cam_XYZA_filter_pts_tem) <= 1e-4, axis=2)
-# filter_pc_index = np.argmax(match_matrix, axis=0)
 
 index_inliers_set = set(inliers)
 cam_XYZA_filter_idx = []
@@ -169,6 +160,20 @@ save_h5(os.path.join(out_dir, 'cam_XYZA.h5'), \
          (cam_XYZA_filter_id2.astype(np.uint64), 'id2', 'uint64'), \
          (cam_XYZA_filter_pts.astype(np.float32), 'pc', 'float32'), \
         ])
+
+# compute cloud normal
+cloud2 = pcl.PointCloud(cam_XYZA_pts.astype(np.float32))
+# ne = pcl.IntegralImageNormalEstimation(cloud2)
+# ne.set_NormalEstimation_Method_AVERAGE_3D_GRADIENT()
+# ne.set_MaxDepthChange_Factor(0.02)
+# ne.set_NormalSmoothingSize(10.0)
+# normals = ne.compute()
+
+import pointcloud_normal
+
+normalpoint = pointcloud_normal.kSearchNormalEstimation(non_ground_points)
+# pointcloud_normal.radiusSearchNormalEstimation(cloud2)
+# pointcloud_normal.integralImageNormalEstimation(cloud2)
 
 gt_nor = cam.get_normal_map(objectID)[0]
 Image.fromarray(((gt_nor+1)/2*255).astype(np.uint8)).save(os.path.join(out_dir, 'gt_nor.png'))
@@ -198,6 +203,10 @@ out_info['target_object_part_joint_id'] = env.target_object_part_joint_id
 
 # get pixel 3D pulling direction (cam/world)
 direction_cam = gt_nor[x, y, :3]
+idx_ = np.random.randint(cam_XYZA_filter_pts.shape[0])
+x, y = cam_XYZA_filter_id1[idx_], cam_XYZA_filter_id2[idx_]
+direction_cam = normalpoint[idx_][:3]
+
 direction_cam /= np.linalg.norm(direction_cam)
 out_info['direction_camera'] = direction_cam.tolist()
 flog.write('Direction Camera: %f %f %f\n' % (direction_cam[0], direction_cam[1], direction_cam[2]))
@@ -303,6 +312,7 @@ position_local_xyz1 = np.linalg.inv(target_link_mat44) @ position_world_xyz1 # p
 success = True
 try:
     env.open_gripper(env.robotID, env.joints, gripper_main_control_joint_name, mimic_joint_name)
+    env.wait_n_steps(500)
 
     # approach
     env.move_to_target_pose(final_rotmat, 500, custom=False) # final_rotmat 齐次坐标形式的位姿矩阵4✖4

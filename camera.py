@@ -14,11 +14,11 @@ from PIL import Image
 from normal_map import startConvert
 
 class Camera:
-    def __init__(self, near=0.1, far=100.0, size=448, fov=35, dist=5.0, fixed_position=True):
+    def __init__(self, near=0.01, far=20.0, size=448, fov=35, dist=5.0, fixed_position=True):
         self.width, self.height = size, size
         self.near, self.far = near, far
         self.fov = fov
-
+        self.scale = 1000
         aspect = self.width / self.height
 
         if fixed_position:
@@ -35,6 +35,7 @@ class Camera:
         left = left / np.linalg.norm(left)
         up = np.cross(forward, left)
         #视图矩阵：计算世界坐标系中的物体在摄像机坐标系下的坐标
+        print("pose", pos)
         self.view_matrix = p.computeViewMatrix(pos,
                                                forward,
                                                up)
@@ -42,9 +43,15 @@ class Camera:
         self.projection_matrix = p.computeProjectionMatrixFOV(self.fov, aspect, self.near, self.far)
         _view_matrix = np.array(self.view_matrix).reshape((4, 4), order='F')
         _projection_matrix = np.array(self.projection_matrix).reshape((4, 4), order='F')
+        print("self.projection_matrix ", self.projection_matrix)
+        print("self._view_matrix ", _view_matrix)
         #@ ：相乘运算，inv：计算逆矩阵
         self.tran_pix_world = np.linalg.inv(_projection_matrix @ _view_matrix)
 
+        self.cx = self.width/2
+        self.cy = self.height/2
+        self.fx = self.projection_matrix[0]*self.width/2
+        self.fy = self.projection_matrix[5]*self.height/2
         mat44 = np.eye(4)
         mat44[:3, :3] = np.vstack([forward, left, up]).T
         mat44[:3, 3] = pos      # mat44 is cam2world
@@ -70,7 +77,7 @@ class Camera:
     def shot(self):
         # Get depth values using the OpenGL renderer
         _w, _h, rgb, depth, seg = p.getCameraImage(self.width, self.height,
-                                                   self.view_matrix, self.projection_matrix, [0, 0, 0.01], lightDistance=1,
+                                                   self.view_matrix, self.projection_matrix, renderer=p.ER_BULLET_HARDWARE_OPENGL
                                                    )
         return rgb, depth, seg
     '''
@@ -94,12 +101,80 @@ class Camera:
     
     def compute_camera_XYZA(self, depth):
         camera_matrix = self.tran_pix_world[:3, :3]
-        y, x = np.where(depth < 1) # 输出所有为True的元素的索引
+        y, x = np.where(depth < 5) # 输出所有为True的元素的索引
         z = self.near * self.far / (self.far + depth * (self.near - self.far))
         permutation = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]])
         points = (permutation @ np.dot(np.linalg.inv(camera_matrix), \
             np.stack([x, y, np.ones_like(x)] * z[y, x], 0))).T # np.ones_like(x)为 写成齐次坐标形式，*z[y, x]为了将深度值映射到一个特定的范围内
         return y, x, points
+
+    def create_point_cloud_from_depth_image(self, depth, organized=True):
+        """ Generate point cloud using depth image only.
+
+            Input:
+                depth: [numpy.ndarray, (H,W), numpy.float32]
+                    depth image
+                camera: [CameraInfo]
+                    camera intrinsics
+                organized: bool
+                    whether to keep the cloud in image shape (H,W,3)
+
+            Output:
+                cloud: [numpy.ndarray, (H,W,3)/(H*W,3), numpy.float32]
+                    generated cloud, (H,W,3) for organized=True, (H*W,3) for organized=False
+        """
+        assert(depth.shape[0] == self.height and depth.shape[1] == self.width)
+        depImg = self.far * self.near / (self.far - (self.far - self.near) * depth)
+        depImg = np.asanyarray(depImg).astype(np.float32) * 1000
+        depth = (depImg.astype(np.uint16))
+        print(type(depImg[0, 0]))
+        
+        camera_matrix = self.tran_pix_world
+        # xmap = np.arange(self.width)
+        # ymap = np.arange(self.height)
+        ymap, xmap = np.where(depth < 1000)
+        # points_z[ymap, xmap]
+
+        # xmap, ymap = np.meshgrid(xmap, ymap)
+        points_z = depth[ymap, xmap] / self.scale
+        points_x = (xmap - self.cx) * points_z / self.fx
+        points_y = (ymap - self.cy) * points_z / self.fy
+        cloud = np.stack([points_x, points_y, points_z], axis=-1)
+        if not organized:
+            cloud = cloud.reshape([-1, 3])
+        # permutation = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]])
+        # points = (permutation @ np.dot(np.linalg.inv(camera_matrix), \
+        #     np.stack([points_x, points_y, np.ones_like(points_x)] * points_z[points_y, points_x], 0))).T 
+        cloud_transformed = self.transform_point_cloud(cloud, camera_matrix, format='4x4')
+        return ymap, xmap, cloud
+
+    def transform_point_cloud(self, cloud, transform, format='3x3'):
+        """ Transform points to new coordinates with transformation matrix.
+
+            Input:
+                cloud: [np.ndarray, (N,3), np.float32]
+                    points in original coordinates
+                transform: [np.ndarray, (3,3)/(3,4)/(4,4), np.float32]
+                    transformation matrix, could be rotation only or rotation+translation
+                format: [string, '3x3'/'3x4'/'4x4']
+                    the shape of transformation matrix
+                    '3x3' --> rotation matrix
+                    '3x4'/'4x4' --> rotation matrix + translation matrix
+
+            Output:
+                cloud_transformed: [np.ndarray, (N,3), np.float32]
+                    points in new coordinates
+        """
+        if not (format == '3x3' or format == '4x4' or format == '3x4'):
+            raise ValueError('Unknown transformation format, only support \'3x3\' or \'4x4\' or \'3x4\'.')
+        if format == '3x3':
+            cloud_transformed = np.dot(transform, cloud.T).T
+        elif format == '4x4' or format == '3x4':
+            ones = np.ones(cloud.shape[0])[:, np.newaxis]
+            cloud_ = np.concatenate([cloud, ones], axis=1)
+            cloud_transformed = np.dot(transform, cloud_.T).T
+            cloud_transformed = cloud_transformed[:, :3]
+        return cloud_transformed
 
     @staticmethod
     def compute_XYZA_matrix(id1, id2, pts, size1, size2): # 将点 pts 放置在（size1, size2）矩阵的位置 (id1, id2) 上
