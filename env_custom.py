@@ -95,6 +95,8 @@ class Env(gym.Env):
         self.robotID = p.loadURDF(self.robotUrdfPath, self.robotStartPos, self.robotStartOrn,
                      flags=p.URDF_USE_SELF_COLLISION_EXCLUDE_PARENT, useFixedBase=True)
         
+        return self.robotID
+        
     def set_target_object_part_actor_id(self, actor_id, custom=True):
         self.target_object_part_actor_id = actor_id
             

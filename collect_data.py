@@ -15,7 +15,7 @@ from argparse import ArgumentParser
 from utils import get_global_position_from_camera, save_h5
 from sapien.core import Pose
 from env_custom import Env, ContactError
-from camera import Camera
+from camera import Camera,CameraIntrinsic,_bind_camera_to_end, update_camera_image, update_camera_image_to_base, point_cloud_flter
 # from robots.kinova_robot import Robot
 # from robots.ur5_robot import Robot
 import pyvista as pv
@@ -30,6 +30,7 @@ import pybullet_data
 from collections import namedtuple
 from attrdict import AttrDict
 import open3d as o3d
+import matplotlib.pyplot as plt
 
 parser = ArgumentParser()
 parser.add_argument('category', type=str) # StorageFurniture
@@ -70,8 +71,13 @@ if args.random_seed is not None:
     np.random.seed(args.random_seed)
     out_info['random_seed'] = args.random_seed
 
+camera_config = "./setup.json"
+with open(camera_config, "r") as j:
+    config = json.load(j)
+
+camera_intrinsic = CameraIntrinsic.from_dict(config["intrinsic"])  # 相机内参数据
 # setup camera
-cam = Camera(dist=1, fixed_position=False)
+cam = Camera(camera_intrinsic, dist=0.5, fixed_position=False)
 
 # setup env
 env = Env()
@@ -80,7 +86,7 @@ out_info['camera_metadata'] = cam.get_metadata_json()
 
 # p.resetDebugVisualizerCamera(2.0, -270., -60., (0., 0., 0.))
 #重置相机的位置
-p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 1)  # Shadows on/off
+# p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 1)  # Shadows on/off
 #开启光线渲染
 
 # load shape
@@ -100,12 +106,22 @@ while still_timesteps < 1000:
     env.step()
     still_timesteps += 1
 
+dist = 1
+theta = np.random.random() * np.pi*2
+phi = (np.random.random()+1) * np.pi/4
+pose = np.array([dist*np.cos(phi)*np.cos(theta), \
+        dist*np.cos(phi)*np.sin(theta), \
+        dist*np.sin(phi)])
+relative_offset = pose
+
+rgb, depth, pc, cwT = update_camera_image_to_base(relative_offset, cam)
+cam_XYZA_id1, cam_XYZA_id2, cam_XYZA_pts = point_cloud_flter(pc, depth)
 ### use the GT vision
-rgb, depth, _ = cam.shot()
+# rgb, depth, _ = cam.shot()
 Image.fromarray((rgb).astype(np.uint8)).save(os.path.join(out_dir, 'rgb.png'))
 
 # 根据深度图（depth）和相机的内参矩阵来计算相机坐标系中的三维点
-cam_XYZA_id1, cam_XYZA_id2, cam_XYZA_pts = cam.create_point_cloud_from_depth_image(depth) # 返回有效深度值的像素位置（y, x）和计算出的三维点坐标（points）。
+# cam_XYZA_id1, cam_XYZA_id2, cam_XYZA_pts = cam.create_point_cloud_from_depth_image(depth, organized=True) # 返回有效深度值的像素位置（y, x）和计算出的三维点坐标（points）。
 # ''' show
 pv.plot(
     cam_XYZA_pts,
@@ -115,6 +131,8 @@ pv.plot(
     show_scalar_bar=False,
 )
 # '''
+positive_mask = cam_XYZA_pts > 0  # 创建布尔掩码
+positive_numbers = cam_XYZA_pts[positive_mask] # 选择正数元素
 
 cloud = pcl.PointCloud(cam_XYZA_pts.astype(np.float32))
 # 创建SAC-IA分割对象
@@ -139,6 +157,9 @@ pv.plot(
     show_scalar_bar=False,
 )
 # '''
+positive_mask = cam_XYZA_filter_pts > 0  # 创建布尔掩码
+positive_numbers = cam_XYZA_filter_pts[positive_mask] # 选择正数元素
+
 cam_XYZA_pts_tmp = np.array(cam_XYZA_pts).astype(np.float32)
 cam_XYZA_filter_pts_tem = np.array(cam_XYZA_filter_pts).astype(np.float32)
 
@@ -172,10 +193,8 @@ cloud2 = pcl.PointCloud(cam_XYZA_pts.astype(np.float32))
 import pointcloud_normal
 
 normalpoint = pointcloud_normal.kSearchNormalEstimation(non_ground_points)
-# pointcloud_normal.radiusSearchNormalEstimation(cloud2)
-# pointcloud_normal.integralImageNormalEstimation(cloud2)
 
-gt_nor = cam.get_normal_map(objectID)[0]
+gt_nor = cam.get_normal_map(relative_offset, cam)[0]
 Image.fromarray(((gt_nor+1)/2*255).astype(np.uint8)).save(os.path.join(out_dir, 'gt_nor.png'))
 
 object_link_ids = env.movable_link_ids
@@ -203,10 +222,11 @@ out_info['target_object_part_joint_id'] = env.target_object_part_joint_id
 
 # get pixel 3D pulling direction (cam/world)
 direction_cam = gt_nor[x, y, :3]
+p.addUserDebugLine([direction_cam[0], direction_cam[1], direction_cam[2]], \
+                   [100*direction_cam[0], 100*direction_cam[1], 100*direction_cam[2]], [1, 0, 0])
 idx_ = np.random.randint(cam_XYZA_filter_pts.shape[0])
 x, y = cam_XYZA_filter_id1[idx_], cam_XYZA_filter_id2[idx_]
 direction_cam = normalpoint[idx_][:3]
-
 direction_cam /= np.linalg.norm(direction_cam)
 out_info['direction_camera'] = direction_cam.tolist()
 flog.write('Direction Camera: %f %f %f\n' % (direction_cam[0], direction_cam[1], direction_cam[2]))
@@ -225,18 +245,14 @@ action_direction_world = cam.get_metadata_json()['mat44'][:3, :3] @ action_direc
 out_info['gripper_direction_world'] = action_direction_world.tolist()
 print("angle between cam to grasp", action_direction_cam @ direction_cam)
 
-# get pixel 3D position (cam/world)
-position_cam = cam_XYZA[x, y, :3]
-if (np.sum(position_cam) == 0):
-    print("position_cam : ", position_cam)
-    sys.exit
-out_info['position_cam'] = position_cam.tolist()
-position_cam_xyz1 = np.ones((4), dtype=np.float32)
-position_cam_xyz1[:3] = position_cam
-position_world_xyz1 = cam.get_metadata_json()['mat44'] @ position_cam_xyz1
-position_world = position_world_xyz1[:3]
-out_info['position_world'] = position_world.tolist()
 
+# get pixel 3D position (cam/world)
+position_world_xyz1 = cam_XYZA[x, y, :3]
+position_world = position_world_xyz1[:3]
+
+p.addUserDebugLine([position_world[0], position_world[1], position_world[2]], \
+                   [10*position_world[0], 10*position_world[1], 10*position_world[2]], [0, 0, 1])
+p.addUserDebugPoints([[position_world[0], position_world[1], position_world[2]]], [[0, 0, 1]], pointSize=8)
 # compute final pose
 up = np.array(action_direction_world, dtype=np.float32)
 forward = np.random.randn(3).astype(np.float32)
@@ -284,13 +300,13 @@ if action_direction is not None:
 # robot_urdf_fn = './robots/robotiq_85/urdf/robotiq_85_gripper_simple.urdf'
 # robot_urdf_fn = './robots/ur5_description/urdf/ur5_robotiq_85.urdf'
 robot_urdf_fn = './robots/kinova_j2s7s300/urdf/j2s7s300.urdf'
-# robot = Robot(env, robot_urdf_fn)
 
 env.load_robot()
 # move to the final pose
-rgb_final_pose, _ = cam.get_observation()
+rgb_final_pose, depth, _, _ = update_camera_image_to_base(relative_offset, cam)
+
 rgb_final_pose = cv2.circle(rgb_final_pose, (y, x), radius=2, color=(255, 0, 3), thickness=5)
-Image.fromarray((rgb_final_pose*255).astype(np.uint8)).save(os.path.join(out_dir, 'viz_target_pose.png'))
+Image.fromarray((rgb_final_pose).astype(np.uint8)).save(os.path.join(out_dir, 'viz_target_pose.png'))
 
 # move back
 # activate contact checking
