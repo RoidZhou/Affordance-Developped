@@ -360,10 +360,10 @@ class Frame(object):
         return pc
 
 def point_cloud_flter(pc, depth):
-        ymap, xmap = np.where(depth < 2000)
-        pc = pc[xmap, ymap]
+        row, col = np.where(depth < 2000)
+        pc = pc[row, col]
 
-        return xmap, ymap, pc
+        return row, col, pc
 
 def _build_projection_matrix(intrinsic, near, far):
     perspective = np.array(
@@ -406,6 +406,18 @@ class DebugAxes(object):
         self.uids[1] = p.addUserDebugLine(pos, pos + axis_y * 0.05, [0, 1, 0], replaceItemUniqueId=self.uids[1])
         self.uids[2] = p.addUserDebugLine(pos, pos + axis_z * 0.05, [0, 0, 1], replaceItemUniqueId=self.uids[2])
 
+def showAxes(pos, axis_x, axis_y, axis_z):
+    p.addUserDebugLine(pos, pos + axis_x * 0.5, [1, 0, 0]) # red
+    p.addUserDebugLine(pos, pos + axis_y * 0.5, [0, 1, 0]) # green
+    p.addUserDebugLine(pos, pos + axis_z * 0.5, [0, 0, 1]) # blue
+
+def ornshowAxes(pos, orn):
+    rot3x3 = R.from_quat(orn).as_matrix()
+    axis_x, axis_y, axis_z = rot3x3.T
+    print("axis_x, axis_y, axis_z ", axis_x, axis_y, axis_z)
+    p.addUserDebugLine(pos, pos + axis_x * 0.5, [1, 0, 0], lineWidth=2) # red
+    p.addUserDebugLine(pos, pos + axis_y * 0.5, [0, 1, 0], lineWidth=2) # green
+    p.addUserDebugLine(pos, pos + axis_z * 0.5, [0, 0, 1], lineWidth=2) # blue
 
 def _gl_ortho(left, right, bottom, top, near, far):
     ortho = np.diag(
@@ -463,15 +475,15 @@ def update_camera_image_to_base(relative_offset, camera):
     matplotlib.use('TkAgg')  # 大小写无所谓 tkaGg ,TkAgg 都行
     import matplotlib.pyplot as plt
 
-    plt.figure(num=1)
-    plt.imshow(rgb)
-    plt.show()
+    # plt.figure(num=1)
+    # plt.imshow(rgb)
+    # plt.show()
 
-    plt.figure(num=2)
-    plt.imshow(rgbd)
-    plt.show()
+    # plt.figure(num=2)
+    # plt.imshow(rgbd)
+    # plt.show()
 
-    return rgb, rgbd, pc, gl_view_matrix
+    return rgb, rgbd, pc, cwT
 
 
 def _bind_camera_to_base(end_pos, end_orn_or, relative_offset):
@@ -543,3 +555,15 @@ def _bind_camera_to_end(end_pos, end_orn_or):
 
     wcT[:3, :3] = np.matmul(wcT[:3, :3], fg)
     return wcT
+
+def get_target_part_pose(objectID, tablaID):
+    cid = p.createConstraint(objectID, -1, tablaID, -1, p.JOINT_FIXED, [0, 0, 0], [0, 0, 0], [0, 0, 1])
+    cInfo = p.getConstraintInfo(cid)
+    print("info: ", cInfo[7])
+    print("info: ", cInfo[9])
+
+    # info = p.getLinkState(self.objectID, self.objLinkID)
+    pose = cInfo[7]
+    orie = cInfo[9]
+
+    return pose, orie

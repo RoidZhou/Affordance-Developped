@@ -7,6 +7,9 @@ import pybullet_data
 from collections import namedtuple
 from attrdict import AttrDict
 import numpy as np
+from utils import get_robot_ee_pose, rotateMatrixToEulerAngles, rotateMatrixToEulerAngles2, eulerAnglesToRotationMatrix,rotation_matrix_to_quaternion,create_orthogonal_vectors
+from camera import ornshowAxes, showAxes, ornshowAxes
+from scipy.spatial.transform import Rotation as R
 
 serverMode = p.GUI # GUI/DIRECT
 robotUrdfPath = "./kinova_j2s7s300/urdf/j2s7s300.urdf"
@@ -21,11 +24,59 @@ p.setAdditionalSearchPath(pybullet_data.getDataPath())
 p.setGravity(0, 0, -10) # NOTE
 planeID = p.loadURDF("plane.urdf")
 
+robotStartPos0 = [0.1, 0, 0.2]
+robotStartPos1 = [0.1, 0, 0.4]
+robotStartPos2 = [0.1, 0, 0.6]
 
-robotStartPos = [0, 0, 0]
-robotStartOrn = p.getQuaternionFromEuler([0, 0, 1.57])
-robotID = p.loadURDF(robotUrdfPath, robotStartPos, robotStartOrn,
+# 初始化 gripper坐标系，默认gripper正方向朝向-z轴
+robotStartOrn = p.getQuaternionFromEuler([0, 0, 0])
+# gripper坐标系绕y轴旋转-pi/2, 使其正方向朝向+x轴
+robotStartOrn1 = p.getQuaternionFromEuler([0, -np.pi/2, 0])
+robotStartrot3x3 = R.from_quat(robotStartOrn).as_matrix()
+robotStart2rot3x3 = R.from_quat(robotStartOrn1).as_matrix()
+# gripper坐标变换
+basegrippermatZTX = robotStartrot3x3@robotStart2rot3x3
+robotStartOrn2 = R.from_matrix(basegrippermatZTX).as_quat()
+# ornshowAxes(robotStartPos0, robotStartOrn2)
+
+# 建立gripper朝向向量relative_offset，[0，0，1]为+z轴方向，由于默认gripper正方向朝向-z轴，所以x轴为-relative_offset
+relative_offset = np.array([-0.5652227 , -0.7988421 , -0.20585054])
+p.addUserDebugLine(robotStartPos2, robotStartPos2 + relative_offset*1, [0, 1, 0])
+
+# 以 relative_offset 为x轴建立正交坐标系
+forward, up, left = create_orthogonal_vectors(relative_offset)
+fg = np.vstack([forward, up, left]).T
+robotStartOrnfg = R.from_matrix(fg).as_quat()
+# ornshowAxes(robotStartPos1, robotStartOrnfg)
+print("res: ", np.cross(fg[:, 0], relative_offset))
+
+# gripper坐标变换
+basegrippermatT = fg@basegrippermatZTX
+robotStartOrn3 = R.from_matrix(basegrippermatT).as_quat()
+theta_x, theta_y, theta_z = p.getEulerFromQuaternion(robotStartOrn3)
+print("pose, orie0: ", robotStartPos1, robotStartOrn3, theta_x, theta_y, theta_z)
+# showAxes(robotStartPos1, basegrippermatT[0], basegrippermatT[1], basegrippermatT[2])
+ornshowAxes(robotStartPos2, robotStartOrn3)
+print("res: ", np.cross(basegrippermatT[:, 2], relative_offset))
+
+robotID = p.loadURDF(robotUrdfPath, robotStartPos2, robotStartOrn3,
                      flags=p.URDF_USE_SELF_COLLISION_EXCLUDE_PARENT)
+pose, orie = get_robot_ee_pose(robotID, 5)
+theta_x, theta_y, theta_z = p.getEulerFromQuaternion(orie)
+print("pose, orie1: ", pose, orie, theta_x, theta_y, theta_z)
+ornshowAxes(pose, orie)
+'''
+# 绕x轴旋转90度
+R_AB = np.array([[1,0,0],  # x轴
+                 [0,0,-1], # y轴
+                 [0,1,0]]) # z轴
+'''
+robotID = p.loadURDF(robotUrdfPath, robotStartPos1, robotStartOrn3,
+                     flags=p.URDF_USE_SELF_COLLISION_EXCLUDE_PARENT)
+pose, orie = get_robot_ee_pose(robotID, 5)
+theta_x, theta_y, theta_z = p.getEulerFromQuaternion(orie)
+print("pose, orie1: ", pose, orie, theta_x, theta_y, theta_z)
+ornshowAxes(pose, orie)
 
 # load Object
 ObjectID = p.loadURDF("./urdf/object_demo.urdf", [0, 0, 0.10], globalScaling=0.0030)

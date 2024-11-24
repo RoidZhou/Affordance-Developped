@@ -9,7 +9,7 @@ import pybullet_data
 import math
 import numpy as np
 import random
-from utils import pose2exp_coordinate, adjoint_matrix
+from utils import pose2exp_coordinate, adjoint_matrix, get_joint_positions, get_movable_joints, unit_point, get_com_pose, link_from_name, CLIENT
 
 class ContactError(Exception):
     pass
@@ -25,7 +25,7 @@ class Env(gym.Env):
         self.control_dt=1./240.
         self.prev_observation = tuple()
         self.endeffort_link = "j2s7s300_link_7"
-        self.eefID = 6
+        self.eefID = -1
         self.objLinkID = 0
         self.check_contact = False
         self.hand_actor_id = self.eefID
@@ -91,9 +91,10 @@ class Env(gym.Env):
                 break
         return self.objectID
     
-    def load_robot(self):
-        self.robotID = p.loadURDF(self.robotUrdfPath, self.robotStartPos, self.robotStartOrn,
+    def load_robot(self, pose, orne):
+        self.robotID = p.loadURDF(self.robotUrdfPath, pose, orne,
                      flags=p.URDF_USE_SELF_COLLISION_EXCLUDE_PARENT, useFixedBase=True)
+        self.eefID = link_from_name(self.robotID, self.endeffort_link)
         
         return self.robotID
         
@@ -101,7 +102,7 @@ class Env(gym.Env):
         self.target_object_part_actor_id = actor_id
             
     # 计算从一个当前末端执行器（end effector, EE）姿态到目标末端执行器姿态所需的“扭转”（twist）
-    def calculate_twist(self, time_to_target, target_ee_pose):
+    def calculate_twist(self, time_to_target, target_ee_pose: np.ndarray):
         eefPose_mat44 = np.eye(4)
         pose, orie = self.get_robot_ee_pose()
         object_matrix = np.array(p.getMatrixFromQuaternion(orie)).reshape(3,3)
@@ -135,6 +136,8 @@ class Env(gym.Env):
             # print("qvel : ", qvel)
             self.setJointPosition(self.robotID, qvel)
             self.step() # 报异常
+            end_effector_pose = get_com_pose(self.robotID, self.eefID)
+            print("end_effector_pose", end_effector_pose)
         return
 
     def move_to_target_pose_onestep(self, target_ee_pose: np.ndarray) -> None:
@@ -192,7 +195,7 @@ class Env(gym.Env):
         return pose, orie
 
     def get_robot_ee_pose(self):
-        cInfo = p.getLinkState(self.robotID, self.eefID)
+        cInfo = get_com_pose(self.robotID, self.eefID)
         pose = cInfo[0]
         orie = cInfo[1]
 
@@ -244,6 +247,17 @@ class Env(gym.Env):
         joint_torques = [state[3] for state in joint_states]
         return joint_positions, joint_velocities, joint_torques
 
+    def compute_jacobian(self, robot, link, positions=None):
+        joints = get_movable_joints(robot)
+        if positions is None:
+            positions = get_joint_positions(robot, joints)
+        assert len(joints) == len(positions)
+        velocities = [0.0] * len(positions)
+        accelerations = [0.0] * len(positions)
+        translate, rotate = p.calculateJacobian(robot, link, unit_point(), positions,
+                                                velocities, accelerations, physicsClientId=CLIENT)
+        #movable_from_joints(robot, joints)
+        return list(zip(*translate)), list(zip(*rotate)) # len(joints) x 3
 
     def getMotorJointStates(self, robot):
         joint_states = p.getJointStates(robot, range(p.getNumJoints(robot)))
@@ -287,14 +301,14 @@ class Env(gym.Env):
                                 computeLinkVelocity=1,
                                 computeForwardKinematics=1)
         link_trn, link_rot, com_trn, com_rot, frame_pos, frame_rot, link_vt, link_vr = result
-        jac_t, jac_r = p.calculateJacobian(self.robotID, self.eefID, com_trn, mpos, zero_vec, zero_vec)
-        
+        # jac_t, jac_r = p.calculateJacobian(self.robotID, self.eefID, com_trn, mpos, zero_vec, zero_vec)
+        jac_t, jac_r = self.compute_jacobian(self.robotID, self.eefID)
         ee_jacobian = np.zeros([6, 6]) # 列为关节数
-        jac_t = np.array(jac_t)[:, :6]
-        jac_r = np.array(jac_r)[:, :6]
+        jac_t = np.array(jac_t)[:6, :]
+        jac_r = np.array(jac_r)[:6, :]
 
-        ee_jacobian[:3, :] = np.array(jac_t)
-        ee_jacobian[3:6, :] =np.array(jac_r)
+        ee_jacobian[:, 3:6] = np.array(jac_t)
+        ee_jacobian[:, :3] = np.array(jac_r)
 
         #numerical_small_bool = ee_jacobian < 1e-1
         #ee_jacobian[numerical_small_bool] = 0

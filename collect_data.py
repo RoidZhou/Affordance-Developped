@@ -12,10 +12,10 @@ from PIL import Image
 import cv2
 import json
 from argparse import ArgumentParser
-from utils import get_global_position_from_camera, save_h5
+from utils import get_robot_ee_pose, are_parallel, get_global_position_from_camera, save_h5, rotateMatrixToEulerAngles,create_orthogonal_vectors2,create_orthogonal_vectors
 from sapien.core import Pose
 from env_custom import Env, ContactError
-from camera import Camera,CameraIntrinsic,_bind_camera_to_end, update_camera_image, update_camera_image_to_base, point_cloud_flter
+from camera import ornshowAxes, Camera, CameraIntrinsic,showAxes,_bind_camera_to_end, update_camera_image, update_camera_image_to_base, point_cloud_flter
 # from robots.kinova_robot import Robot
 # from robots.ur5_robot import Robot
 import pyvista as pv
@@ -31,6 +31,7 @@ from collections import namedtuple
 from attrdict import AttrDict
 import open3d as o3d
 import matplotlib.pyplot as plt
+from scipy.spatial.transform import Rotation as R
 
 parser = ArgumentParser()
 parser.add_argument('category', type=str) # StorageFurniture
@@ -106,15 +107,15 @@ while still_timesteps < 1000:
     env.step()
     still_timesteps += 1
 
-dist = 1
+dist = 0.5
 theta = np.random.random() * np.pi*2
 phi = (np.random.random()+1) * np.pi/4
 pose = np.array([dist*np.cos(phi)*np.cos(theta), \
         dist*np.cos(phi)*np.sin(theta), \
         dist*np.sin(phi)])
-relative_offset = pose
+relative_offset_pose = pose
 
-rgb, depth, pc, cwT = update_camera_image_to_base(relative_offset, cam)
+rgb, depth, pc, cwT = update_camera_image_to_base(relative_offset_pose, cam)
 cam_XYZA_id1, cam_XYZA_id2, cam_XYZA_pts = point_cloud_flter(pc, depth)
 ### use the GT vision
 # rgb, depth, _ = cam.shot()
@@ -194,7 +195,7 @@ import pointcloud_normal
 
 normalpoint = pointcloud_normal.kSearchNormalEstimation(non_ground_points)
 
-gt_nor = cam.get_normal_map(relative_offset, cam)[0]
+gt_nor = cam.get_normal_map(relative_offset_pose, cam)[0]
 Image.fromarray(((gt_nor+1)/2*255).astype(np.uint8)).save(os.path.join(out_dir, 'gt_nor.png'))
 
 object_link_ids = env.movable_link_ids
@@ -221,62 +222,82 @@ out_info['target_object_part_actor_id'] = env.target_object_part_actor_id
 out_info['target_object_part_joint_id'] = env.target_object_part_joint_id
 
 # get pixel 3D pulling direction (cam/world)
-direction_cam = gt_nor[x, y, :3]
-p.addUserDebugLine([direction_cam[0], direction_cam[1], direction_cam[2]], \
-                   [100*direction_cam[0], 100*direction_cam[1], 100*direction_cam[2]], [1, 0, 0])
+# direction_cam = gt_nor[x, y, :3]
+
 idx_ = np.random.randint(cam_XYZA_filter_pts.shape[0])
 x, y = cam_XYZA_filter_id1[idx_], cam_XYZA_filter_id2[idx_]
-direction_cam = normalpoint[idx_][:3]
+# direction_cam = normalpoint[idx_][:3]
+direction_cam = gt_nor[x, y, :3]
+
 direction_cam /= np.linalg.norm(direction_cam)
 out_info['direction_camera'] = direction_cam.tolist()
 flog.write('Direction Camera: %f %f %f\n' % (direction_cam[0], direction_cam[1], direction_cam[2]))
-direction_world = cam.get_metadata_json()['mat44'][:3, :3] @ direction_cam
-out_info['direction_world'] = direction_world.tolist()
-flog.write('Direction World: %f %f %f\n' % (direction_world[0], direction_world[1], direction_world[2]))
-flog.write('mat44: %s\n' % str(cam.get_metadata_json()['mat44']))
+
+# get pixel 3D position (cam/world)
+position_world_xyz1 = cam_XYZA[x, y, :3]
+position_world = position_world_xyz1[:3]
+p.addUserDebugLine(position_world, position_world + direction_cam*1, [1, 0, 0])
+p.addUserDebugText(str("gt_nor"), position_world, [1, 0, 0])
+
+# direction_world = cwT[:3, :3] @ direction_cam
+# out_info['direction_world'] = direction_world.tolist()
+# flog.write('Direction World: %f %f %f\n' % (direction_world[0], direction_world[1], direction_world[2]))
+flog.write('mat44: %s\n' % str(cwT))
 
 # sample a random direction in the hemisphere (cam/world)
 action_direction_cam = np.random.randn(3).astype(np.float32)
 action_direction_cam /= np.linalg.norm(action_direction_cam)
 if action_direction_cam @ direction_cam > 0: # 两个向量的夹角小于90度
     action_direction_cam = -action_direction_cam
-out_info['gripper_direction_camera'] = action_direction_cam.tolist() # position p
-action_direction_world = cam.get_metadata_json()['mat44'][:3, :3] @ action_direction_cam
+# out_info['gripper_direction_camera'] = action_direction_cam.tolist() # position p
+action_direction_world = action_direction_cam
 out_info['gripper_direction_world'] = action_direction_world.tolist()
-print("angle between cam to grasp", action_direction_cam @ direction_cam)
+robotStartPos0 = [0.1, 0, 0.2]
+robotStartPos1 = [0.1, 0, 0.4]
+robotStartPos2 = [0.1, 0, 0.6]
 
-
-# get pixel 3D position (cam/world)
-position_world_xyz1 = cam_XYZA[x, y, :3]
-position_world = position_world_xyz1[:3]
-
-p.addUserDebugLine([position_world[0], position_world[1], position_world[2]], \
-                   [10*position_world[0], 10*position_world[1], 10*position_world[2]], [0, 0, 1])
-p.addUserDebugPoints([[position_world[0], position_world[1], position_world[2]]], [[0, 0, 1]], pointSize=8)
 # compute final pose
-up = np.array(action_direction_world, dtype=np.float32)
-forward = np.random.randn(3).astype(np.float32)
-while (up @ forward) > 0.99 or (up @ forward) < 0:
-    forward = np.random.randn(3).astype(np.float32)
-left = np.cross(up, forward)
-left /= np.linalg.norm(left)
-forward = np.cross(left, up)
-forward /= np.linalg.norm(forward)
-out_info['gripper_forward_direction_world'] = forward.tolist()
-forward_cam = np.linalg.inv(cam.get_metadata_json()['mat44'][:3, :3]) @ forward
-out_info['gripper_forward_direction_camera'] = forward_cam.tolist() # orientation
+# 初始化 gripper坐标系，默认gripper正方向朝向-z轴
+robotStartOrn = p.getQuaternionFromEuler([0, 0, 0])
+# gripper坐标系绕y轴旋转-pi/2, 使其正方向朝向+x轴
+robotStartOrn1 = p.getQuaternionFromEuler([0, -np.pi/2, 0])
+robotStartrot3x3 = R.from_quat(robotStartOrn).as_matrix()
+robotStart2rot3x3 = R.from_quat(robotStartOrn1).as_matrix()
+# gripper坐标变换
+basegrippermatZTX = robotStartrot3x3@robotStart2rot3x3
+robotStartOrn2 = R.from_matrix(basegrippermatZTX).as_quat()
+
+# 建立gripper朝向向量relative_offset，[0，0，1]为+z轴方向，由于默认gripper正方向朝向-z轴，所以x轴为-relative_offset
+relative_offset = np.array(action_direction_world)
+p.addUserDebugLine(robotStartPos2, robotStartPos2 + relative_offset*1, [0, 1, 0])
+p.addUserDebugText(str("action_direction_world"), robotStartPos2, [0, 1, 0])
+
+# 以 -relative_offset 为x轴建立正交坐标系
+forward, up, left = create_orthogonal_vectors(relative_offset)
+fg = np.vstack([forward, up, left]).T
+robotStartOrnfg = R.from_matrix(fg).as_quat()
+print("res: ", np.cross(fg[:, 0], relative_offset))
+
+# gripper坐标变换
+basegrippermatT = fg@basegrippermatZTX
+robotStartOrn3 = R.from_matrix(basegrippermatT).as_quat()
+theta_x, theta_y, theta_z = p.getEulerFromQuaternion(robotStartOrn3)
+ornshowAxes(robotStartPos2, robotStartOrn3)
+print("res: ", np.cross(basegrippermatT[:, 2], relative_offset))
+
 rotmat = np.eye(4).astype(np.float32) # 旋转矩阵
-rotmat[:3, 0] = -forward
-rotmat[:3, 1] = left
-rotmat[:3, 2] = -up
+rotmat[:3, :3] = basegrippermatT
 
 # final_dist = 0.13 # ur5 grasp
-final_dist = 0.14
+final_dist = 0.2
 
 final_rotmat = np.array(rotmat, dtype=np.float32)
 final_rotmat[:3, 3] = position_world - action_direction_world * final_dist # 以齐次坐标形式添加 平移向量
 final_pose = Pose().from_transformation_matrix(final_rotmat) # 变换矩阵转位置和旋转（四元数）
 out_info['target_rotmat_world'] = final_rotmat.tolist()
+p.addUserDebugPoints([[position_world[0], position_world[1], position_world[2]]], [[0, 1, 0]], pointSize=8)
+
+p.addUserDebugPoints([[final_rotmat[:3, 3][0], final_rotmat[:3, 3][1], final_rotmat[:3, 3][2]]], [[0, 0, 1]], pointSize=8)
 
 start_rotmat = np.array(rotmat, dtype=np.float32)
 # start_rotmat[:3, 3] = position_world - action_direction_world * 0.2 # 以齐次坐标形式添加 平移向量  ur5 grasp
@@ -291,7 +312,7 @@ if action_direction is not None:
     end_rotmat[:3, 3] = position_world - action_direction_world * final_dist + action_direction * 0.05
     out_info['end_rotmat_world'] = end_rotmat.tolist()
 
-
+# showAxes(start_pose.p, forward, left, -up) # red, green, blue
 ### viz the EE gripper position
 # setup robot
 # robot_urdf_fn = './robots/panda_gripper.urdf'
@@ -301,9 +322,12 @@ if action_direction is not None:
 # robot_urdf_fn = './robots/ur5_description/urdf/ur5_robotiq_85.urdf'
 robot_urdf_fn = './robots/kinova_j2s7s300/urdf/j2s7s300.urdf'
 
-env.load_robot()
+robotID = env.load_robot(final_rotmat[:3, 3], robotStartOrn3)
+pose, orie = get_robot_ee_pose(robotID, 5)
+theta_x, theta_y, theta_z = p.getEulerFromQuaternion(orie)
+ornshowAxes(pose, orie)
 # move to the final pose
-rgb_final_pose, depth, _, _ = update_camera_image_to_base(relative_offset, cam)
+rgb_final_pose, depth, _, _ = update_camera_image_to_base(relative_offset_pose, cam)
 
 rgb_final_pose = cv2.circle(rgb_final_pose, (y, x), radius=2, color=(255, 0, 3), thickness=5)
 Image.fromarray((rgb_final_pose).astype(np.uint8)).save(os.path.join(out_dir, 'viz_target_pose.png'))
@@ -312,7 +336,6 @@ Image.fromarray((rgb_final_pose).astype(np.uint8)).save(os.path.join(out_dir, 'v
 # activate contact checking
 env.setup_gripper(env.robotID)
 env.start_checking_contact(env.gripper_actor_ids, env.hand_actor_id)
-
 
 ### main steps
 out_info['start_target_part_qpos'] = env.get_target_part_qpos(custom=False)
@@ -323,7 +346,9 @@ object_matrix = np.array(p.getMatrixFromQuaternion(orie)).reshape(3,3)
 target_link_mat44[:3, :3] = object_matrix
 target_link_mat44[:3, 3] = pose
 # 某一点云坐标相对于物体Link坐标发生的位姿变换, 该点云坐标不随Link运动而变化          inv: 从物体Link坐标系变换回全局坐标系的逆变换，表示将点从世界坐标系变换到物体Link坐标系
-position_local_xyz1 = np.linalg.inv(target_link_mat44) @ position_world_xyz1 # position_world_xyz1: 世界坐标系下物体上某一点云坐标
+position_world_xyz2 = np.ones((4), dtype=np.float32)
+position_world_xyz2[:3] = position_world_xyz1 
+position_local_xyz1 = np.linalg.inv(target_link_mat44) @ position_world_xyz2 # position_world_xyz1: 世界坐标系下物体上某一点云坐标
 
 success = True
 try:

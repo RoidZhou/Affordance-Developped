@@ -7,6 +7,7 @@ import importlib
 import random
 import shutil
 from PIL import Image
+from collections import namedtuple
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(BASE_DIR, '../utils'))
 from colors import colors
@@ -14,7 +15,20 @@ colors = np.array(colors, dtype=np.float32)
 import matplotlib.pylab as plt
 from mpl_toolkits.mplot3d import Axes3D
 from subprocess import call
+import pybullet as p
+CLIENT = 0
+BASE_LINK = -1
+# Joints
 
+JOINT_TYPES = {
+    p.JOINT_REVOLUTE: 'revolute', # 0
+    p.JOINT_PRISMATIC: 'prismatic', # 1
+    p.JOINT_SPHERICAL: 'spherical', # 2
+    p.JOINT_PLANAR: 'planar', # 3
+    p.JOINT_FIXED: 'fixed', # 4
+    p.JOINT_POINT2POINT: 'point2point', # 5
+    p.JOINT_GEAR: 'gear', # 6
+}
 
 def force_mkdir(folder):
     if os.path.exists(folder):
@@ -245,3 +259,225 @@ def save_h5(fn, data):
     for d, n, t in data:
         fout.create_dataset(n, data=d, compression='gzip', compression_opts=4, dtype=t)
     fout.close()
+
+JointInfo = namedtuple('JointInfo', ['jointIndex', 'jointName', 'jointType',
+                                     'qIndex', 'uIndex', 'flags',
+                                     'jointDamping', 'jointFriction', 'jointLowerLimit', 'jointUpperLimit',
+                                     'jointMaxForce', 'jointMaxVelocity', 'linkName', 'jointAxis',
+                                     'parentFramePos', 'parentFrameOrn', 'parentIndex'])
+
+JointState = namedtuple('JointState', ['jointPosition', 'jointVelocity',
+                                       'jointReactionForces', 'appliedJointMotorTorque'])
+
+LinkState = namedtuple('LinkState', ['linkWorldPosition', 'linkWorldOrientation',
+                                     'localInertialFramePosition', 'localInertialFrameOrientation',
+                                     'worldLinkFramePosition', 'worldLinkFrameOrientation'])
+
+BodyInfo = namedtuple('BodyInfo', ['base_name', 'body_name'])
+
+def get_pose(body):
+    return p.getBasePositionAndOrientation(body, physicsClientId=CLIENT)
+
+def get_num_joints(body):
+    return p.getNumJoints(body, physicsClientId=CLIENT)
+
+def get_joints(body):
+    return list(range(get_num_joints(body)))
+
+def get_joint_info(body, joint):
+    return JointInfo(*p.getJointInfo(body, joint, physicsClientId=CLIENT))
+
+def get_joint_type(body, joint):
+    return get_joint_info(body, joint).jointType
+
+def is_fixed(body, joint):
+    return get_joint_type(body, joint) == p.JOINT_FIXED
+
+def is_movable(body, joint):
+    return not is_fixed(body, joint)
+
+def prune_fixed_joints(body, joints):
+    return [joint for joint in joints if is_movable(body, joint)]
+
+def get_movable_joints(body): # 45 / 87 on pr2
+    return prune_fixed_joints(body, get_joints(body))
+
+def get_joint_state(body, joint):
+    return JointState(*p.getJointState(body, joint, physicsClientId=CLIENT))
+
+def get_joint_position(body, joint):
+    return get_joint_state(body, joint).jointPosition
+
+def get_joint_velocity(body, joint):
+    return get_joint_state(body, joint).jointVelocity
+
+def get_joint_reaction_force(body, joint):
+    return get_joint_state(body, joint).jointReactionForces
+
+def get_joint_torque(body, joint):
+    return get_joint_state(body, joint).appliedJointMotorTorque
+
+def get_joint_positions(body, joints): # joints=None):
+    return tuple(get_joint_position(body, joint) for joint in joints)
+
+def get_joint_velocities(body, joints):
+    return tuple(get_joint_velocity(body, joint) for joint in joints)
+
+def unit_point():
+    return (0., 0., 0.)
+
+def get_link_state(body, link, kinematics=True, velocity=True):
+    # TODO: the defaults are set to False?
+    # https://github.com/bulletphysics/bullet3/blob/master/examples/pybullet/pybullet.c
+    return LinkState(*p.getLinkState(body, link,
+                                     #computeForwardKinematics=kinematics,
+                                     #computeLinkVelocity=velocity,
+                                     physicsClientId=CLIENT))
+
+def get_com_pose(body, link): # COM = center of mass
+    if link == BASE_LINK:
+        return get_pose(body)
+    link_state = get_link_state(body, link)
+    # urdfLinkFrame = comLinkFrame * localInertialFrame.inverse()
+    return link_state.linkWorldPosition, link_state.linkWorldOrientation
+
+def get_body_info(body):
+    # TODO: p.syncBodyInfo
+    return BodyInfo(*p.getBodyInfo(body, physicsClientId=CLIENT))
+
+def get_base_name(body):
+    return get_body_info(body).base_name.decode(encoding='UTF-8')
+
+def get_link_name(body, link):
+    if link == BASE_LINK:
+        return get_base_name(body)
+    return get_joint_info(body, link).linkName.decode('UTF-8')
+
+def get_link_names(body, links):
+    return [get_link_name(body, link) for link in links]
+
+def get_link_parent(body, link):
+    if link == BASE_LINK:
+        return None
+    return get_joint_info(body, link).parentIndex
+
+parent_link_from_joint = get_link_parent
+
+def link_from_name(body, name):
+    if name == get_base_name(body):
+        return BASE_LINK
+    for link in get_joints(body):
+        if get_link_name(body, link) == name:
+            return link
+    raise ValueError(body, name)
+
+def rotateMatrixToEulerAngles(RM):
+    theta_z = np.arctan2(RM[1, 0], RM[0, 0])
+    theta_y = np.arctan2(-1 * RM[2, 0], np.sqrt(RM[2, 1] * RM[2, 1] + RM[2, 2] * RM[2, 2]))
+    theta_x = np.arctan2(RM[2, 1], RM[2, 2])
+    print(f"Euler angles:\ntheta_x: {theta_x}\ntheta_y: {theta_y}\ntheta_z: {theta_z}")
+    return theta_x, theta_y, theta_z
+
+# 旋转矩阵到欧拉角(角度制)
+def rotateMatrixToEulerAngles2(RM):
+    theta_z = np.arctan2(RM[1, 0], RM[0, 0]) / np.pi * 180
+    theta_y = np.arctan2(-1 * RM[2, 0], np.sqrt(RM[2, 1] * RM[2, 1] + RM[2, 2] * RM[2, 2])) / np.pi * 180
+    theta_x = np.arctan2(RM[2, 1], RM[2, 2]) / np.pi * 180
+    print(f"Euler angles:\ntheta_x: {theta_x}\ntheta_y: {theta_y}\ntheta_z: {theta_z}")
+    return theta_x, theta_y, theta_z
+
+def eulerAnglesToRotationMatrix(theta):
+    R_x = np.array([[1, 0, 0],
+                    [0, np.cos(theta[0]), -np.sin(theta[0])],
+                    [0, np.sin(theta[0]), np.cos(theta[0])]
+                    ])
+
+    R_y = np.array([[np.cos(theta[1]), 0, np.sin(theta[1])],
+                    [0, 1, 0],
+                    [-np.sin(theta[1]), 0, np.cos(theta[1])]
+                    ])
+
+    R_z = np.array([[np.cos(theta[2]), -np.sin(theta[2]), 0],
+                    [np.sin(theta[2]), np.cos(theta[2]), 0],
+                    [0, 0, 1]
+                    ])
+
+    R = np.dot(R_z, np.dot(R_y, R_x))
+    print(f"Rotate matrix:\n{R}")
+    return R
+
+def rotation_matrix_to_quaternion(R):
+    """将旋转矩阵转换为四元数"""
+    w = np.sqrt(1 + R[0, 0] + R[1, 1] + R[2, 2]) / 2
+    x = (R[2, 1] - R[1, 2]) / (4 * w)
+    y = (R[0, 2] - R[2, 0]) / (4 * w)
+    z = (R[1, 0] - R[0, 1]) / (4 * w)
+    print("R", R)
+    return np.array([w, x, y, z])
+
+def create_orthogonal_vectors(v):
+    """ 
+    Creates three orthonormal vectors from a given direction vector, respecting the right-hand rule. 
+    Args: v: The input direction vector (NumPy array). 
+    Returns: A tuple containing three orthonormal vectors (u, m, n) as NumPy arrays. 
+    Returns None if input is invalid. 
+    """ 
+    if v.shape != (3,): 
+        print("Error: Input vector must be a 3D vector.") 
+        return None 
+    
+    # 规范化方向向量 
+    u = v / np.linalg.norm(v) 
+    # 选择第二个向量 (这里选择 y 轴，你可以根据需要修改)
+    w = np.array([0, 1, 0]) 
+    if np.allclose(np.cross(u,w),np.zeros(3)): #如果与Y轴平行，就选X轴 
+        w = np.array([1, 0, 0]) 
+        
+    # 计算第三个向量并规范化 
+    v_prime = np.cross(u, w) 
+    n = v_prime / np.linalg.norm(v_prime) 
+    
+    #重新计算第二个向量 
+    m = np.cross(n, u) 
+    
+    return u, m, n
+
+def create_orthogonal_vectors2(v):
+    """ 
+    Creates three orthonormal vectors from a given direction vector, respecting the right-hand rule. 
+    Args: v: The input direction vector (NumPy array). 
+    Returns: A tuple containing three orthonormal vectors (u, m, n) as NumPy arrays. 
+    Returns None if input is invalid. 
+    """ 
+    if v.shape != (3,): 
+        print("Error: Input vector must be a 3D vector.") 
+        return None 
+
+    # 规范化方向向量 
+    u = v / np.linalg.norm(v) 
+    # 选择第二个向量 (这里选择随机，你可以根据需要修改)
+    w = np.random.randn(3).astype(np.float32)
+ 
+    while (u @ w) > 0.99 or (u @ w) < 0:
+        w = np.random.randn(3).astype(np.float32)
+
+    # 计算第三个向量并规范化 
+    v_prime = np.cross(u, w) 
+    n = v_prime / np.linalg.norm(v_prime) 
+    
+    #重新计算第二个向量 
+    m = np.cross(n, u) 
+    
+    return u, m, n
+
+def are_parallel(a, b, tolerance=1e-6):
+    cross_product = np.cross(a, b)
+
+    return np.allclose(cross_product, np.zeros(3), atol=tolerance)
+
+def get_robot_ee_pose(robotID, eefID):
+    cInfo = get_com_pose(robotID, eefID)
+    pose = cInfo[0]
+    orie = cInfo[1]
+
+    return pose, orie
